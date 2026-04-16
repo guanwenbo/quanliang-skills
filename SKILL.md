@@ -1,6 +1,6 @@
 ---
 name: robot-business-feign-flow
-description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取机器人群列表、向指定群发送指定消息。适用于基于 hishop-switch 字段语义的自动化编排场景，包含 token 获取、绑定前置、群列表分页与群消息发送。
+description: 通过 openclaw 直连圈量接口，先让用户输入机器人ID并拉取机器人所在群列表，再让用户输入目标群和消息后发送。适用于基于 hishop-switch 字段语义的自动化编排场景，包含 token 获取、群列表分页与群消息发送。
 ---
 
 # 文档基准（最新）
@@ -18,9 +18,10 @@ description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取
 
 主流程目标（openclaw）：
 
-1. 绑定机器人（登录二维码 -> 人工扫码 -> 机器人可用）
-2. 拉取机器人群列表（分页）
-3. 按指定 `groupId` 发送指定消息
+1. 用户输入 `robotId`
+2. 调用 `GetRobotGroupList` 拉取机器人所在群列表（分页）
+3. 用户从群列表中选择目标群，并输入消息
+4. 调用 `SendMsgToGroup` 发送群聊消息
 
 补充能力（可选）：
 
@@ -62,42 +63,44 @@ description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取
 
 说明：`RobotBusinessFeignClient` 在工程里通过拦截器自动做这件事；本 skill 要求在 openclaw 中显式分步完成。
 
-# 主流程（绑定 -> 拉群 -> 发群消息）
+# 主流程（先拉群 -> 再发消息）
 
 ## Step 0 输入参数
 
-最小输入：
+初始输入（第一阶段）：
 
 - `appKey`
 - `appSecret`
 - `wwCorpId`
 - `robotId`
+- `robotId`
+
+第二阶段补充输入（拿到群列表后再向用户询问）：
+
 - `targetGroupId`
 - `messageText`（或完整 `msgList`）
 
-## Step 1 绑定机器人（前置）
+## Step 1 让用户输入机器人ID并拉取群列表
 
-推荐流程：
+1. 向用户收集 `robotId`。
+2. 调 `POST /GetRobotGroupList`。
+3. 入参：`robot_id + limit + offset`。
+4. 按 `has_more` 翻页拉全量 `group_list`。
+5. 将 `group_id + name` 返回给用户供选择。
 
-1. 调 `POST /GenHostAccountLoginQRCode` 生成扫码登录二维码。
-2. 人工扫码完成登录绑定。
-3. 通过状态接口确认机器人已可用（例如轮询状态查询接口，直到在线/可发消息）。
+## Step 2 让用户选择群并输入消息
 
-说明：若机器人已绑定且在线，可跳过本步骤。
-
-## Step 2 拉取群列表
-
-1. 调 `POST /GetRobotWatchGroupChatList`
-2. 入参：`robotId + limit + offset`
-3. 按 `hasMore` 翻页拉全量 `groupList`
-4. 校验 `targetGroupId` 是否存在于群列表
+1. 要求用户从 `group_list` 中选择 `targetGroupId`。
+2. 让用户输入待发送消息文本（或完整 `msg_list`）。
+3. 校验 `targetGroupId` 必须存在于上一步拉取结果中。
 
 ## Step 3 向指定群发消息
 
 1. 组装 `POST /SendMsgToGroup` 请求体：
-   - `robotId`
-   - `groupId = targetGroupId`
-   - `msgList`（建议先发 `TEXT`）
+   - `robot_id`
+   - `group_id = targetGroupId`
+   - `msg_id`（建议每次请求唯一）
+   - `msg_list`（建议先发 `TEXT`）
 2. 调用后检查 `errcode == 0`
 3. 记录 `msgSn` 用于后续异步回执对账
 
@@ -109,22 +112,23 @@ description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取
 
 # 关键接口剧本
 
-## 1) getRobotWatchGroupChatList（主流程必需）
+## 1) getRobotGroupList（主流程必需）
 
 ### 接口信息
-- 最新文档页面：`/md/03-群相关/02-群列表/3201-GetWatchGroupChatList.html`
-- 路径：`POST /GetRobotWatchGroupChatList`
-- 入参：`RobotIdPageSendRequest`
-- 出参：`BaseRobotResponse<RobotGroupPageResponse>`
+- 最新文档页面：`/md/03-群相关/02-群列表/3203-GetRobotGroupList.html`
+- 路径：`POST /GetRobotGroupList`
+- 入参：`robot_id + limit + offset`
+- 出参：`data.has_more + data.group_list`
 
 ### 操作步骤
 1. 校验 `robotId`。
 2. 初始分页参数建议：`limit=100, offset=0`。
-3. 直连调用 `POST /GetRobotWatchGroupChatList`。
+3. 直连调用 `POST /GetRobotGroupList`。
 4. 判断：
-   - `errCode == 0` 且 `data != null`
-   - 读取 `data.groupList`
-5. 若 `hasMore=true`，递增 `offset` 继续拉取。
+   - `errcode == 0` 且 `data != null`
+   - 读取 `data.group_list`
+5. 若 `has_more=true`，递增 `offset` 继续拉取。
+6. 将 `group_list` 转成“群ID+群名称”的可选项给用户。
 
 ## 2) sendMsgToGroup（主流程必需）
 
@@ -135,10 +139,10 @@ description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取
 - 出参：`BaseRobotResponse<RobotMsgSnResponse>`
 
 ### 操作步骤
-1. 校验 `robotId/groupId/msgList`。
+1. 校验 `robot_id/group_id/msg_list`。
 2. 若 `msgType` 为 `FILE/VIDEO`，对 `href` 文件名 URL 编码。
 3. 调 `POST /SendMsgToGroup`。
-4. 读取 `data.msgSn`。
+4. 读取 `data.msg_sn`。
 
 ## 3) getRobotAccountList（可选）
 
@@ -218,15 +222,15 @@ description: 通过 openclaw 直连圈量接口，完成机器人绑定、拉取
 
 1. `http_get_access_token`
 2. `http_get_subcorp_token`
-3. `http_bind_robot`（`GenHostAccountLoginQRCode` + 人工扫码等待）
-4. `http_get_watch_group_list`（分页循环）
+3. `ask_robot_id`（向用户收集机器人ID）
+4. `http_get_robot_group_list`（`GetRobotGroupList` 分页循环）
 5. `http_send_msg_to_group`
 
 变量传递：
 
 - action1.token -> action2.header.Token
-- action2.subCorpToken -> action3/4/5.header.Token
-- action4.groupList -> action5.groupId 选择逻辑
+- action2.subCorpToken -> action4/5.header.Token
+- action4.group_list -> 用户选择 `targetGroupId` -> action5.group_id
 
 # 字段策略（重要）
 
